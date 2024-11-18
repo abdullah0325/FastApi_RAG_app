@@ -1,141 +1,99 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from pydantic import BaseModel
-from typing import List, Optional
-import os
-from PyPDF2 import PdfReader
-import docx
+import streamlit as st
 import requests
-from bs4 import BeautifulSoup
-from youtube_transcript_api import YouTubeTranscriptApi
-from langchain.chat_models import ChatOpenAI
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.text_splitter import CharacterTextSplitter
-from langchain.vectorstores import FAISS
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
-import io
-from fastapi.middleware.cors import CORSMiddleware
+import os
+from streamlit_chat import message
+from dotenv import load_dotenv
 
-app = FastAPI()
+# Configuration
+BACKEND_URL = "http://localhost:8000"  # FastAPI backend URL
 
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def main():
+    load_dotenv()
+    st.set_page_config(page_title="Chat with your document")
+    st.header("Abdullah GPT")
 
-# Store conversations in memory
-conversations = {}
+    # Initialize session state
+    if "conversation_id" not in st.session_state:
+        st.session_state.conversation_id = None
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+    if "processComplete" not in st.session_state:
+        st.session_state.processComplete = None
 
-class QuestionRequest(BaseModel):
-    question: str
-    conversation_id: str
+    # Sidebar for file upload and configuration
+    with st.sidebar:
+        uploaded_files = st.file_uploader("Upload your document", type=['pdf'], accept_multiple_files=True)
+        blog_url = st.text_input("Enter the blog URL")
+        youtube_url = st.text_input("Enter the YouTube video URL")
+        openai_api_key = st.secrets["OPENAI_API_KEY"]
+        process = st.button("Submit")
 
-@app.post("/process")
-async def process_input(
-    files: Optional[List[UploadFile]] = File(None),
-    blog_url: str = Form(None),
-    youtube_url: str = Form(None),
-    openai_api_key: str = Form(...)
-):
-    try:
-        text = ""
-        
-        # Process files if uploaded
-        if files:
-            for file in files:
-                content = await file.read()
-                file_extension = os.path.splitext(file.filename)[1].lower()
+    if process:
+        if not openai_api_key:
+            st.info("Please add your OpenAI API key to continue.")
+            st.stop()
+
+        try:
+            # Prepare the files and data for the API request
+            files = []
+            if uploaded_files:
+                for file in uploaded_files:
+                    files.append(("files", file))
+
+            # Make API request to process the input
+            response = requests.post(
+                f"{BACKEND_URL}/process",
+                files=files if files else None,
+                data={
+                    "blog_url": blog_url if blog_url else None,
+                    "youtube_url": youtube_url if youtube_url else None,
+                    "openai_api_key": openai_api_key
+                }
+            )
+            
+            if response.status_code == 200:
+                st.session_state.conversation_id = response.json()["conversation_id"]
+                st.session_state.processComplete = True
+                st.write("Processing complete! You can now ask questions.")
+            else:
+                st.error(f"Error: {response.json()['detail']}")
+
+        except Exception as e:
+            st.error(f"An error occurred: {str(e)}")
+
+    # Chat interface
+    if st.session_state.processComplete:
+        user_question = st.chat_input("Ask a question about the uploaded document, blog, or YouTube video.")
+        if user_question:
+            try:
+                # Send question to backend
+                response = requests.post(
+                    f"{BACKEND_URL}/ask",
+                    json={
+                        "question": user_question,
+                        "conversation_id": st.session_state.conversation_id
+                    }
+                )
                 
-                if file_extension == ".pdf":
-                    pdf_file = io.BytesIO(content)
-                    pdf_reader = PdfReader(pdf_file)
-                    for page in pdf_reader.pages:
-                        text += page.extract_text()
-                elif file_extension == ".docx":
-                    docx_file = io.BytesIO(content)
-                    doc = docx.Document(docx_file)
-                    text += " ".join([para.text for para in doc.paragraphs])
-        
-        # Process blog URL
-        elif blog_url:
-            response = requests.get(blog_url)
-            soup = BeautifulSoup(response.content, 'html.parser')
-            paragraphs = soup.find_all('p')
-            text = " ".join([para.get_text() for para in paragraphs])
-        
-        # Process YouTube URL
-        elif youtube_url:
-            video_id = youtube_url.split('v=')[-1]
-            transcript = YouTubeTranscriptApi.get_transcript(video_id)
-            text = " ".join([item['text'] for item in transcript])
-        
-        if not text:
-            raise HTTPException(status_code=400, detail="No content could be extracted from the provided input")
+                if response.status_code == 200:
+                    # Update chat history
+                    result = response.json()
+                    st.session_state.chat_history = result["chat_history"]
+                    
+                    # Display chat history
+                    response_container = st.container()
+                    with response_container:
+                        for message_obj in st.session_state.chat_history:
+                            message(
+                                message_obj["content"],
+                                is_user=message_obj["role"] == "user",
+                                key=str(hash(message_obj["content"]))
+                            )
+                else:
+                    st.error(f"Error: {response.json()['detail']}")
 
-        # Process the text
-        text_chunks = get_text_chunks(text)
-        vectorstore = get_vectorstore(text_chunks)
-        conversation_chain = get_conversation_chain(vectorstore, openai_api_key)
+            except Exception as e:
+                st.error(f"An error occurred: {str(e)}")
 
-        # Generate conversation ID
-        import uuid
-        conversation_id = str(uuid.uuid4())
-        conversations[conversation_id] = conversation_chain
-
-        return {"conversation_id": conversation_id, "status": "success"}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/ask")
-async def ask_question(request: QuestionRequest):
-    if request.conversation_id not in conversations:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-
-    try:
-        conversation_chain = conversations[request.conversation_id]
-        response = conversation_chain({'question': request.question})
-        
-        chat_history = []
-        for i, msg in enumerate(response['chat_history']):
-            chat_history.append({
-                "role": "user" if i % 2 == 0 else "assistant",
-                "content": msg.content
-            })
-        
-        return {
-            "answer": response['answer'],
-            "chat_history": chat_history
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-def get_text_chunks(text):
-    text_splitter = CharacterTextSplitter(
-        separator="\n",
-        chunk_size=900,
-        chunk_overlap=100,
-        length_function=len
-    )
-    return text_splitter.split_text(text)
-
-def get_vectorstore(text_chunks):
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    return FAISS.from_texts(text_chunks, embeddings)
-
-def get_conversation_chain(vectorstore, openai_api_key):
-    llm = ChatOpenAI(openai_api_key=openai_api_key, model_name='gpt-3.5-turbo', temperature=0)
-    memory = ConversationBufferMemory(memory_key='chat_history', return_messages=True)
-    return ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=vectorstore.as_retriever(),
-        memory=memory
-    )
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+if __name__ == '__main__':
+    main()
